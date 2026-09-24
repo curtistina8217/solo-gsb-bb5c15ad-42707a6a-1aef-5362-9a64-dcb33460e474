@@ -52,6 +52,17 @@ POST /safe-download-name 解析上游 Content-Disposition 头值，产出可直�
 回退到传统 filename（token 或 quoted-string，按 UTF-8 优先、ISO-8859-1
 兜底解码）；解码后剥离路径前缀（/ 与 \\）、全部控制字符以及尾部的点与
 空格，空名与 "."/".." 等危险名称一律拒绝，无法得到有效名称时返回 422。
+
+POST /client-range-decision 把客户端的 Range 与 If-Range 请求头转换为
+对象代理可直接执行的决策：输入对象总长度、当前强 ETag 或 Last-Modified
+（二者至少其一）、可选的 Range/If-Range 头原值与 /plan 规划参数。服务按
+RFC 9110 字节范围语义解析多段闭区间、开放终点（bytes=N-）与 suffix
+（bytes=-N），跳过单个不可满足段；全部不可满足时给出 416 决策
+（Content-Range: bytes */总长）。If-Range 不存在时 Range 恒按有效处理；
+If-Range 存在但与当前验证器不匹配（含弱 ETag 永不与强验证器强匹配）时，
+忽略 Range 并给出返回完整对象的 200 决策；匹配时对可满足段复用 /plan
+规划逻辑，给出可供后续 /assemble 使用的 206 决策。Range/If-Range 或当前
+验证器本身的头值语法非法时返回带 loc 的 422。
 """
 
 from __future__ import annotations
@@ -67,6 +78,7 @@ import re
 import secrets
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Union
 
 from fastapi import FastAPI, Request
@@ -2473,6 +2485,670 @@ def range_response(req: RangeResponseRequest) -> RangeResponseOut:
         media_type="multipart/byteranges",
         boundary=boundary,
         body_b64=base64.b64encode(body).decode("ascii"),
+    )
+
+
+# --------------------------- /client-range-decision ---------------------------
+
+# 请求头与验证器取值的长度上限，抵御超长输入。
+_RANGE_HEADER_MAX_LENGTH = 16384
+_VALIDATOR_MAX_LENGTH = 1000
+
+# HTTP-date 的三种 RFC 9110 允许形式（imf-fixdate / RFC 850 / asctime）。
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+_IMF_FIXDATE_RE = re.compile(
+    r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), "
+    r"(\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) "
+    r"(\d{2}):(\d{2}):(\d{2}) GMT$"
+)
+_RFC850_DATE_RE = re.compile(
+    r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
+    r"(\d{2})-(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(\d{2}) "
+    r"(\d{2}):(\d{2}):(\d{2}) GMT$"
+)
+_ASCTIME_RE = re.compile(
+    r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +"
+    r"(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$"
+)
+_WEEKDAY_FULL = {
+    "Monday": 0, "Tuesday": 1, "Wednesday": 2, "Thursday": 3,
+    "Friday": 4, "Saturday": 5, "Sunday": 6,
+}
+_DAY_RE = re.compile(r"^(0[1-9]|[12][0-9]|3[01])$")
+
+
+class ClientRangeDecisionError(Exception):
+    """客户端 Range/If-Range 头或当前验证器无法解析，统一对应 HTTP 422。
+
+    与 416（语法合法但范围不可满足）不同：422 表示头值本身违反 ABNF 或
+    验证器不是合法的强 ETag / HTTP-date，调用方必须修正输入。loc 指向
+    出错字段（如 "range"、"if_range"、"etag"、"last_modified"）。
+    """
+
+    def __init__(self, message: str, loc: str, *, code: str = "invalid_header"):
+        self.message = message
+        self.loc = loc
+        self.code = code
+        super().__init__(message)
+
+
+@app.exception_handler(ClientRangeDecisionError)
+async def client_range_decision_error_handler(
+    request: Request, exc: ClientRangeDecisionError
+):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": exc.code,
+            "detail": [{"message": exc.message, "loc": exc.loc}],
+        },
+    )
+
+
+class ClientRangeDecisionRequest(BaseModel):
+    """/client-range-decision 请求：对象元数据 + 客户端头原值 + /plan 参数。
+
+    etag 为对象当前的强 ETag 原值（含双引号，禁止 W/ 弱标签）；
+    last_modified 为当前 Last-Modified 的 HTTP-date（必须为 GMT）。
+    二者至少提供一个：If-Range 只能与同类型的当前验证器比较。
+    range 为客户端 Range 头原值（仅接受 bytes 单位）；if_range 为
+    If-Range 头原值（强/弱 entity-tag 或 HTTP-date）。
+    """
+
+    object_length: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="对象总字节长度"
+    )
+    etag: str | None = Field(
+        None,
+        min_length=1,
+        max_length=_VALIDATOR_MAX_LENGTH,
+        description="对象当前的强 ETag 原值（含双引号）；弱 ETag 一律拒绝",
+    )
+    last_modified: str | None = Field(
+        None,
+        min_length=1,
+        max_length=_VALIDATOR_MAX_LENGTH,
+        description="对象当前的 Last-Modified（HTTP-date，GMT）",
+    )
+    range: str | None = Field(
+        None,
+        min_length=1,
+        max_length=_RANGE_HEADER_MAX_LENGTH,
+        description="客户端 Range 请求头原值（仅接受 bytes=...）；缺省表示完整对象",
+    )
+    if_range: str | None = Field(
+        None,
+        min_length=1,
+        max_length=_VALIDATOR_MAX_LENGTH,
+        description="客户端 If-Range 请求头原值（entity-tag 或 HTTP-date）",
+    )
+    max_gap: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="允许合并的最大间隙（字节），透传给 /plan"
+    )
+    fetch_limit: Annotated[int, StrictInt] = Field(
+        ..., ge=1, description="单次回源上限（字节），透传给 /plan"
+    )
+    cached_blocks: list[CachedBlock] = Field(
+        default_factory=list,
+        description="可选的已缓存块列表，透传给 /plan",
+    )
+
+    @model_validator(mode="after")
+    def _check_validators_and_cache_ids(self) -> "ClientRangeDecisionRequest":
+        if self.etag is None and self.last_modified is None:
+            raise ValueError("etag 与 last_modified 必须至少提供一个")
+        seen: set[object] = set()
+        for cb in self.cached_blocks:
+            if cb.cache_id in seen:
+                raise ValueError(
+                    f"cached_blocks 中 cache_id {cb.cache_id!r} 重复"
+                )
+            seen.add(cb.cache_id)
+        return self
+
+
+class IfRangeEvaluation(BaseModel):
+    """If-Range 头的解析与匹配结论（if_range 缺省时整体为 null）。"""
+
+    kind: Literal["etag", "date"] = Field(
+        ..., description="If-Range 取值类型：entity-tag 或 HTTP-date"
+    )
+    weak: bool = Field(
+        ..., description="kind=etag 时是否为弱 ETag（W/ 前缀）；date 恒为 false"
+    )
+    value: str = Field(..., description="去首尾 OWS 后的 If-Range 原值")
+    compared_with: Literal["etag", "last_modified"] = Field(
+        ...,
+        description="实际参与比较的当前验证器类型；类型不匹配时仍按不匹配处理",
+    )
+    matched: bool = Field(..., description="是否与当前验证器匹配")
+
+
+class SkippedRangeOut(BaseModel):
+    """一个被跳过的不可满足 Range 段（保持原始请求顺序）。"""
+
+    segment_index: int = Field(..., description="该段在 Range 头中的从 0 起下标")
+    kind: Literal["interval", "suffix"] = Field(
+        ..., description="段类型：闭区间（含开放终点）或 suffix"
+    )
+    start: int | None = Field(
+        None, description="kind=interval 时解析出的 first-byte-pos"
+    )
+    end: int | None = Field(
+        None, description="kind=interval 时解析出的 last-byte-pos；开放终点为 null"
+    )
+    last_n: int | None = Field(None, description="kind=suffix 时的后缀字节数")
+    reason: Literal["start_past_end", "inverted", "empty_object"] = Field(
+        ...,
+        description="不可满足原因：起点越过/达到对象末尾、反转区间、空对象 suffix",
+    )
+
+
+class DecisionRangeOut(BaseModel):
+    """206 决策中实际交付的一个范围（规范化后按对象偏移顺序）。"""
+
+    index: int = Field(
+        ..., description="交付范围的从 0 起下标，与 /plan mappings[].index 一一对应"
+    )
+    segment_index: int = Field(..., description="对应 Range 头中的段下标")
+    type: Literal["interval", "suffix"] = Field(
+        ..., description="客户端请求段的原始类型（开放终点记为 interval）"
+    )
+    start: int = Field(..., description="规范化后的起始字节偏移（含）")
+    end: int = Field(..., description="规范化后的结束字节偏移（含）")
+    length: int = Field(..., ge=1, description="交付字节数")
+
+
+class FullObjectDecision(BaseModel):
+    """忽略 Range、返回完整对象的 200 决策。"""
+
+    decision: Literal["full_object"]
+    status_code: Literal[200]
+    headers: dict[str, str] = Field(
+        ..., description="建议下发的响应头（至少含 Accept-Ranges）"
+    )
+    reason: Literal["no_range", "if_range_mismatch"] = Field(
+        ...,
+        description="no_range=请求未携带 Range；if_range_mismatch=If-Range 不匹配",
+    )
+    object_length: int
+    if_range: IfRangeEvaluation | None = Field(
+        None, description="If-Range 解析与匹配结论；请求未携带时为 null"
+    )
+
+
+class PartialContentDecision(BaseModel):
+    """对可满足范围执行 /plan 后的 206 决策，plan 可直接用于后续 /assemble。"""
+
+    decision: Literal["partial_content"]
+    status_code: Literal[206]
+    headers: dict[str, str] = Field(
+        ..., description="建议下发的响应头（至少含 Accept-Ranges）"
+    )
+    object_length: int
+    ranges: list[DecisionRangeOut] = Field(
+        ..., description="实际交付的范围（已跳过不可满足段），按对象偏移排序"
+    )
+    skipped_ranges: list[SkippedRangeOut] = Field(
+        ..., description="被跳过的不可满足段（按原始请求顺序）"
+    )
+    if_range: IfRangeEvaluation | None = Field(
+        None, description="If-Range 解析与匹配结论；请求未携带时为 null"
+    )
+    plan: PlanResponse = Field(
+        ...,
+        description="对可满足范围执行 /plan 的完整结果，可直接用于回源与 /assemble",
+    )
+
+
+class RangeNotSatisfiableDecision(BaseModel):
+    """全部范围均不可满足的 416 决策。"""
+
+    decision: Literal["range_not_satisfiable"]
+    status_code: Literal[416]
+    headers: dict[str, str] = Field(
+        ...,
+        description='建议下发的响应头，含 Content-Range: bytes */<object_length>',
+    )
+    object_length: int
+    skipped_ranges: list[SkippedRangeOut] = Field(
+        ..., description="全部不可满足段（按原始请求顺序）"
+    )
+    if_range: IfRangeEvaluation | None = Field(
+        None, description="If-Range 解析与匹配结论；请求未携带时为 null"
+    )
+
+
+ClientRangeDecision = Annotated[
+    Union[FullObjectDecision, PartialContentDecision, RangeNotSatisfiableDecision],
+    Field(discriminator="decision"),
+]
+
+
+def _parse_http_date(raw: str, loc: str) -> datetime:
+    """严格解析 RFC 9110 允许的三种 HTTP-date，返回 UTC aware datetime。
+
+    接受 IMF-fixdate（首选）、过期 RFC 850 日期与 asctime 日期；非 ASCII、
+    额外文本、非 GMT 时区、错误星期、不存在的日期（如 2 月 30 日）一律拒绝。
+    """
+
+    def fail(detail: str) -> ClientRangeDecisionError:
+        return ClientRangeDecisionError(
+            f"{loc_name} 不是合法的 HTTP-date（RFC 9110，仅接受 GMT）：{detail}",
+            loc,
+            code="invalid_http_date",
+        )
+
+    loc_name = "Last-Modified" if loc == "last_modified" else "If-Range"
+    try:
+        raw.encode("ascii")
+    except UnicodeEncodeError:
+        raise fail("包含非 ASCII 字符")
+    value = raw.strip(" \t")
+
+    def build(
+        year: int, mon: str, day: str, hh: str, mm: str, ss: str
+    ) -> datetime:
+        """构造 UTC datetime；不存在的日历日期/越界钟点统一转 422。"""
+        try:
+            return datetime(
+                year, _MONTHS.index(mon) + 1, int(day),
+                int(hh), int(mm), int(ss), tzinfo=timezone.utc,
+            )
+        except ValueError:
+            raise fail("日期或钟点不存在（如月日越界、时/分/秒超出范围）")
+
+    dt: datetime | None = None
+    m = _IMF_FIXDATE_RE.fullmatch(value)
+    if m:
+        wd, day, mon, year, hh, mm, ss = m.groups()
+        dt = build(int(year), mon, day, hh, mm, ss)
+        if _WEEKDAYS[dt.weekday()] != wd:
+            raise fail("星期与日期不一致")
+    else:
+        m = _RFC850_DATE_RE.fullmatch(value)
+        if m:
+            wd_full, day, mon, yy, hh, mm, ss = m.groups()
+            if not _DAY_RE.fullmatch(day):
+                raise fail("日期超出当月范围")
+            year = int(yy)
+            # RFC 9110 的两位年份启发式转换：00..67 → 2000+，68..99 → 1900+。
+            year += 2000 if year < 68 else 1900
+            dt = build(year, mon, day, hh, mm, ss)
+            if dt.weekday() != _WEEKDAY_FULL[wd_full]:
+                raise fail("星期与日期不一致")
+        else:
+            m = _ASCTIME_RE.fullmatch(value)
+            if m:
+                wd, mon, day, hh, mm, ss, year = m.groups()
+                if not _DAY_RE.fullmatch(day.zfill(2)):
+                    raise fail("日期超出当月范围")
+                dt = build(int(year), mon, day, hh, mm, ss)
+                if _WEEKDAYS[dt.weekday()] != wd:
+                    raise fail("星期与日期不一致")
+
+    if dt is None:
+        raise fail(
+            "必须形如 'Sun, 06 Nov 1994 08:49:37 GMT'（IMF-fixdate）"
+        )
+    return dt
+
+
+def _require_strong_etag(raw: str, loc: str) -> str:
+    """校验当前对象的强 ETag，返回去首尾 OWS 后的 opaque-tag。
+
+    弱 ETag（W/ 前缀）不是强验证器，本服务拒绝把它当强匹配依据；
+    非法 opaque-tag（含空格、控制字符、裸引号等）同样拒绝。
+    """
+    value = raw.strip(" \t")
+    label = "etag" if loc == "etag" else "当前 ETag"
+    if value[:2].lower() == "w/":
+        raise ClientRangeDecisionError(
+            f"{label} 不允许是弱 ETag（W/ 前缀）：弱验证器不能用于 "
+            "If-Range 的强匹配，也不能保证字节级一致",
+            loc,
+            code="weak_etag",
+        )
+    # 与 /verify-fetch-batch 的强 ETag 规则一致：opaque-tag 至少含 1 个
+    # etagc（不接受空体 ""），且不得含空白、控制字符或裸引号。
+    if not re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]+"', value):
+        raise ClientRangeDecisionError(
+            f"{label} 不是合法的强 ETag：必须为双引号包裹的 opaque-tag"
+            '（如 "v1"），不得含空格、控制字符或裸引号',
+            loc,
+            code="invalid_etag",
+        )
+    return value
+
+
+def _parse_if_range(
+    raw: str,
+    current_etag: str | None,
+    current_lm: datetime | None,
+) -> IfRangeEvaluation:
+    """解析 If-Range 头并判定是否与当前验证器匹配。
+
+    RFC 9110：If-Range 为 entity-tag 时只做强比较——弱 ETag 永远不匹配；
+    为 HTTP-date 时与 Last-Modified 按时间戳相等比较。entity-tag 形态不
+    合法（非引号开头且非合法日期）按头值语法错误处理（422）。
+    """
+    value = raw.strip(" \t")
+    if value.startswith('"') or value[:2].lower() == "w/":
+        weak = value[:2].lower() == "w/"
+        if weak:
+            tag = value[2:]
+        else:
+            tag = value
+        if not _STRONG_ETAG_RE.fullmatch(tag):
+            raise ClientRangeDecisionError(
+                "If-Range 的 entity-tag 不是合法的 ETag：必须为双引号包裹的"
+                ' opaque-tag（可带 W/ 弱前缀），如 "v1" 或 W/"v1"',
+                "if_range",
+                code="invalid_if_range_etag",
+            )
+        matched = (
+            not weak
+            and current_etag is not None
+            # 强比较逐字节进行，弱标签在上方已短路为 False。
+            and value == current_etag
+        )
+        return IfRangeEvaluation(
+            kind="etag",
+            weak=weak,
+            value=value,
+            compared_with="etag",
+            matched=matched,
+        )
+
+    # 非 entity-tag：必须是合法 HTTP-date，且当前对象提供了 Last-Modified。
+    parsed = _parse_http_date(value, "if_range")
+    matched = current_lm is not None and parsed == current_lm
+    return IfRangeEvaluation(
+        kind="date",
+        weak=False,
+        value=value,
+        compared_with="last_modified",
+        matched=matched,
+    )
+
+
+def _parse_range_header(raw: str, object_length: int) -> tuple[
+    list[tuple[int, int, int, Literal["interval", "suffix"]]],
+    list[SkippedRangeOut],
+]:
+    """解析 ``bytes=...`` Range 头为 (可满足段, 被跳过段)。
+
+    每个可满足段为 (start, end, segment_index, kind)，已按 HTTP 语义钳到
+    对象内（开放终点、超尾 last-byte-pos 与超大 suffix 都会回落），但**不
+    排序、不去重**，交付顺序按对象偏移排序由调用方完成。单个不可满足段
+    跳过；语法错误直接抛 ClientRangeDecisionError（422）。
+    """
+
+    def malformed(detail: str) -> ClientRangeDecisionError:
+        return ClientRangeDecisionError(
+            f"Range 头非法：{detail}（RFC 9110 字节范围语法，如 "
+            "'bytes=0-99'、'bytes=100-'、'bytes=-50'，多段以逗号分隔）",
+            "range",
+        )
+
+    # 头值必须是 ASCII，且不得含任何控制字符（含 CR/LF，防头注入）。
+    try:
+        raw.encode("ascii")
+    except UnicodeEncodeError:
+        raise malformed("包含非 ASCII 字符")
+    if any(ch < " " or ch == "\x7f" for ch in raw):
+        raise malformed("包含控制字符（拒绝 CR/LF 折行与头部注入）")
+
+    value = raw.strip(" \t")
+    if "=" not in value:
+        raise malformed("缺少 '='，必须形如 'bytes=<ranges>'")
+    unit, _, ranges_part = value.partition("=")
+    if unit.strip(" \t").lower() != "bytes":
+        raise malformed("仅支持 bytes 单位")
+    # '=' 两侧 OWS 允许，但 ranges-spec 内部除段间逗号 OWS 外不得有空白。
+
+    satisfiable: list[
+        tuple[int, int, int, Literal["interval", "suffix"]]
+    ] = []
+    skipped: list[SkippedRangeOut] = []
+    segments = ranges_part.split(",")
+    if any(not seg.strip(" \t") for seg in segments):
+        raise malformed("逗号之间存在空段")
+
+    for segment_index, seg in enumerate(segments):
+        token = seg.strip(" \t")
+        if not token:
+            raise malformed(f"第 {segment_index} 段为空")
+        if any(ch in " \t" for ch in token):
+            raise malformed(f"第 {segment_index} 段内部不允许出现空白")
+        if token.count("-") != 1:
+            raise malformed(
+                f"第 {segment_index} 段必须恰好包含一个 '-'"
+            )
+        left, _, right = token.partition("-")
+
+        if left == "":
+            # suffix-byte-range-spec: bytes=-suffix-length
+            if not right.isdigit():
+                raise malformed(
+                    f"第 {segment_index} 段的 suffix-length 必须是非负整数"
+                )
+            last_n = int(right)
+            if object_length == 0:
+                # 空对象上任何 suffix 都不可满足（bytes=-0 同属此类）。
+                skipped.append(
+                    SkippedRangeOut(
+                        segment_index=segment_index,
+                        kind="suffix",
+                        last_n=last_n,
+                        reason="empty_object",
+                    )
+                )
+                continue
+            if last_n == 0:
+                # suffix-length 为 0 语法合法但永远不可满足（RFC 9110 14.1.2）。
+                skipped.append(
+                    SkippedRangeOut(
+                        segment_index=segment_index,
+                        kind="suffix",
+                        last_n=0,
+                        reason="start_past_end",
+                    )
+                )
+                continue
+            start = max(0, object_length - last_n)
+            satisfiable.append(
+                (start, object_length - 1, segment_index, "suffix")
+            )
+            continue
+
+        if not left.isdigit():
+            raise malformed(
+                f"第 {segment_index} 段的 first-byte-pos 必须是非负整数"
+                "（不允许符号或空格）"
+            )
+        first = int(left)
+        if right == "":
+            # 开放终点 bytes=N-：N 越过最后一个字节即不可满足；否则钳到末尾。
+            if first >= object_length:
+                skipped.append(
+                    SkippedRangeOut(
+                        segment_index=segment_index,
+                        kind="interval",
+                        start=first,
+                        end=None,
+                        reason="start_past_end",
+                    )
+                )
+                continue
+            satisfiable.append(
+                (first, object_length - 1, segment_index, "interval")
+            )
+            continue
+
+        if not right.isdigit():
+            raise malformed(
+                f"第 {segment_index} 段的 last-byte-pos 必须是非负整数"
+                "（开放终点应写作 'N-'）"
+            )
+        last = int(right)
+        if last < first:
+            skipped.append(
+                SkippedRangeOut(
+                    segment_index=segment_index,
+                    kind="interval",
+                    start=first,
+                    end=last,
+                    reason="inverted",
+                )
+            )
+            continue
+        if first >= object_length:
+            skipped.append(
+                SkippedRangeOut(
+                    segment_index=segment_index,
+                    kind="interval",
+                    start=first,
+                    end=last,
+                    reason="start_past_end",
+                )
+            )
+            continue
+        # last-byte-pos 超过对象末尾时按 HTTP 语义钳制到最后一个字节。
+        satisfiable.append(
+            (first, min(last, object_length - 1), segment_index, "interval")
+        )
+
+    return satisfiable, skipped
+
+
+@app.post(
+    "/client-range-decision",
+    response_model=ClientRangeDecision,
+)
+def client_range_decision(
+    req: ClientRangeDecisionRequest,
+) -> ClientRangeDecision:
+    """把客户端 Range/If-Range 头转换为对象代理可执行的 200/206/416 决策。
+
+    决策顺序遵循 RFC 9110：先解析当前验证器与客户端头（语法错误 422）；
+    携带 If-Range 但不匹配时无条件忽略 Range，返回完整对象 200；否则解析
+    Range：缺省 → 200；全部不可满足 → 416（Content-Range: bytes */总长）；
+    部分可满足 → 跳过坏段并复用 /plan 规划逻辑返回 206。
+    """
+    accept_ranges = {"Accept-Ranges": "bytes"}
+
+    # 1. 当前验证器必须是合法的强 ETag / HTTP-date（弱 ETag 拒绝当强验证器）。
+    current_etag = _require_strong_etag(req.etag, "etag") if req.etag else None
+    current_lm = (
+        _parse_http_date(req.last_modified, "last_modified")
+        if req.last_modified
+        else None
+    )
+
+    # 2. If-Range（若存在）先解析并匹配；Range 头本身的语法也提前校验，
+    #    让客户端即使在不匹配分支也能得到可定位的 422。
+    if_range_eval: IfRangeEvaluation | None = None
+    if req.if_range is not None:
+        if_range_eval = _parse_if_range(req.if_range, current_etag, current_lm)
+
+    satisfiable: list[
+        tuple[int, int, int, Literal["interval", "suffix"]]
+    ] = []
+    skipped: list[SkippedRangeOut] = []
+    if req.range is not None:
+        satisfiable, skipped = _parse_range_header(
+            req.range, req.object_length
+        )
+
+    # 3. RFC 9110：If-Range 不匹配（弱 ETag 永不强匹配、类型不匹配或取值
+    #    不一致）时，服务器必须忽略 Range 头并返回完整对象。
+    if if_range_eval is not None and not if_range_eval.matched:
+        return FullObjectDecision(
+            decision="full_object",
+            status_code=200,
+            headers=dict(accept_ranges),
+            reason="if_range_mismatch",
+            object_length=req.object_length,
+            if_range=if_range_eval,
+        )
+
+    # 4. 无 Range 头：完整对象 200。
+    if req.range is None:
+        return FullObjectDecision(
+            decision="full_object",
+            status_code=200,
+            headers=dict(accept_ranges),
+            reason="no_range",
+            object_length=req.object_length,
+            if_range=if_range_eval,
+        )
+
+    # 5. 全部段不可满足：416 + Content-Range: bytes */<total>。
+    if not satisfiable:
+        return RangeNotSatisfiableDecision(
+            decision="range_not_satisfiable",
+            status_code=416,
+            headers={
+                **accept_ranges,
+                "Content-Range": f"bytes */{req.object_length}",
+            },
+            object_length=req.object_length,
+            skipped_ranges=skipped,
+            if_range=if_range_eval,
+        )
+
+    # 6. 部分/全部段可满足：按对象偏移排序（保持与 HTTP 多段交付顺序一致），
+    #    复用现有 /plan 逻辑。段类型保留客户端原始语义（开放终点记 interval）。
+    ordered = sorted(satisfiable, key=lambda item: (item[0], item[1]))
+    plan_ranges: list[RangeSpec] = []  # type: ignore[valid-type]
+    decision_ranges: list[DecisionRangeOut] = []
+    for new_index, (start, end, segment_index, kind) in enumerate(ordered):
+        if kind == "suffix":
+            # 交给 /plan 的 suffix 长度按钳制后的实际交付长度给出，保证其
+            # 规范化区间与决策区间一致。
+            last_n = req.object_length - start
+            plan_ranges.append(  # type: ignore[union-attr]
+                SuffixRange(type="suffix", last_n=last_n)
+            )
+        else:
+            plan_ranges.append(  # type: ignore[union-attr]
+                IntervalRange(type="interval", start=start, end=end)
+            )
+        decision_ranges.append(
+            DecisionRangeOut(
+                index=new_index,
+                segment_index=segment_index,
+                type=kind,
+                start=start,
+                end=end,
+                length=end - start + 1,
+            )
+        )
+
+    plan_req = PlanRequest(
+        object_length=req.object_length,
+        ranges=plan_ranges,
+        max_gap=req.max_gap,
+        fetch_limit=req.fetch_limit,
+        cached_blocks=req.cached_blocks,
+    )
+    plan_result = plan(plan_req)
+
+    return PartialContentDecision(
+        decision="partial_content",
+        status_code=206,
+        headers=dict(accept_ranges),
+        object_length=req.object_length,
+        ranges=decision_ranges,
+        skipped_ranges=skipped,
+        if_range=if_range_eval,
+        plan=plan_result,
     )
 
 

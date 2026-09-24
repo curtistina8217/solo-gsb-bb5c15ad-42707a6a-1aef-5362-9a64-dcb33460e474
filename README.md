@@ -39,6 +39,15 @@
   `filename*`（支持 UTF-8 / ISO-8859-1 百分号编码），无效或缺失时回退到传统
   `filename`；解码后剥离路径前缀（`/` 与 `\`）、控制字符及尾部点/空格，空名与
   `.` / `..` 等危险名称一律拒绝，无法得到有效名称时返回 `422`。
+- `POST /client-range-decision`：把**客户端**的 `Range` 与 `If-Range` 请求头
+  转换为对象代理可直接执行的决策。输入对象总长度、当前强 ETag 或
+  Last-Modified（二者至少其一）、可选的 `Range` / `If-Range` 头原值与 `/plan`
+  规划参数；按 RFC 9110 字节范围语义解析多段闭区间、开放终点（`bytes=N-`）与
+  suffix（`bytes=-N`），跳过单个不可满足段，全部不可满足时给出
+  `416`（`Content-Range: bytes */总长`）。`If-Range` 与当前验证器不匹配
+  （弱 ETag 永不强匹配）时忽略 `Range` 并给出完整对象 `200` 决策；匹配时对
+  可满足范围复用 `/plan`，给出可供后续 `/assemble` 使用的 `206` 决策。非法头
+  值返回带 `loc` 的 `422`。
 
 ## Docker 一键启动
 
@@ -832,6 +841,138 @@ print(urllib.request.urlopen(req).read().decode())
 quoted-string、disposition type 缺失等）返回
 `{"error": "invalid_content_disposition", "message": ...}`。请求体字段缺失、
 为空、超长或类型错误则与其他端点一致返回 `422 invalid_request`。
+
+### `POST /client-range-decision`
+
+对象代理（缓存/回源层）用本端点把**下载客户端**发来的 `Range` 与
+`If-Range` 请求头一次性转换为可执行决策，无需自己实现 HTTP 字节范围与条件
+请求语义。端点本身始终以 HTTP 200 返回一个决策信封，信封内的
+`status_code` / `headers` 才是代理应对客户端做出的响应；头值语法非法时才返回
+HTTP `422`。
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_length` | 对象总字节长度 |
+| `etag` | 对象当前的**强 ETag** 原值（含双引号，如 `"v3"`）；弱 ETag（`W/` 前缀）与非法 opaque-tag 返回 `422` |
+| `last_modified` | 对象当前的 `Last-Modified`，必须是合法 HTTP-date（接受 IMF-fixdate / RFC 850 / asctime 三种形式，仅 GMT） |
+| `range` | 可选：客户端 `Range` 头原值，仅支持 `bytes` 单位（如 `bytes=0-99,200-,-16`）；缺省表示客户端请求完整对象 |
+| `if_range` | 可选：客户端 `If-Range` 头原值，强/弱 entity-tag 或 HTTP-date |
+| `max_gap` / `fetch_limit` / `cached_blocks` | 与 `/plan` 完全相同的规划参数，206 决策时原样生效 |
+
+`etag` 与 `last_modified` 必须**至少提供一个**，`If-Range` 只能与同类型的当前
+验证器比较（entity-tag 对 ETag 强比较、HTTP-date 对 Last-Modified 按时刻
+比较）。
+
+#### 决策语义（按 RFC 9110）
+
+1. **头值校验**：`range` / `if_range` / `etag` / `last_modified` 语法非法
+   → HTTP `422`，`detail[0].loc` 精确定位到字段名（如 `range`、`if_range`、
+   `etag`、`last_modified`）。当前 ETag 为弱标签时返回 `weak_etag`——弱验证器
+   永远不能当作强匹配依据。
+2. **`If-Range` 不匹配优先**：携带 `If-Range` 但与当前验证器不匹配（取值不同、
+   `If-Range` 是弱 ETag、或 entity-tag/date 类型不匹配）时，**无条件忽略
+   Range**，给出 `decision="full_object"` 的 200 决策（即使 Range 全部不可满足
+   也不会给 416）。
+3. **无 Range**：`decision="full_object"`，`reason="no_range"`。
+4. **Range 全部不可满足**：`decision="range_not_satisfiable"`，信封
+   `status_code=416`，`headers` 含
+   `Content-Range: bytes */<object_length>` 与 `Accept-Ranges: bytes`。
+5. **至少一段可满足**：`decision="partial_content"`，`status_code=206`。
+   - 单个不可满足段被**跳过**（列在 `skipped_ranges` 中，原因
+     `inverted`（反转区间）/ `start_past_end`（首偏移越过末尾，含 `bytes=-0`）
+     / `empty_object`（空对象 suffix）），其余段照常交付；
+   - `last-byte-pos` 超过对象末尾、开放终点 `bytes=N-` 与超过对象长度的 suffix
+     都按 HTTP 语义钳制到对象内（超大 suffix 回落为整个对象）；
+   - 交付范围 `ranges` 按对象偏移排序（HTTP 多段交付顺序），`index` 与
+     `plan.mappings[].index` 一一对应，`segment_index` 可回溯到 Range 头中的
+     原始段；
+   - `plan` 就是对交付范围执行 `/plan` 的**完整返回**（含 `blocks`、
+     `mappings`、`cached_blocks`），可直接用于回源并提交给 `/assemble`。
+
+请求示例（对象 256 字节，请求 suffix 16 字节、前 100 字节，另含一个反转坏段；
+当前强 ETag 与 If-Range 一致）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/client-range-decision \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "object_length": 256,
+    "etag": "\"v3-strong\"",
+    "range": "bytes=-16,0-99,500-100",
+    "if_range": "\"v3-strong\"",
+    "max_gap": 8,
+    "fetch_limit": 128
+  }'
+```
+
+响应（206 决策；`plan` 可直接驱动回源与 `/assemble`）：
+
+```json
+{
+  "decision": "partial_content",
+  "status_code": 206,
+  "headers": {"Accept-Ranges": "bytes"},
+  "object_length": 256,
+  "ranges": [
+    {"index": 0, "segment_index": 1, "type": "interval",
+     "start": 0, "end": 99, "length": 100},
+    {"index": 1, "segment_index": 0, "type": "suffix",
+     "start": 240, "end": 255, "length": 16}
+  ],
+  "skipped_ranges": [
+    {"segment_index": 2, "kind": "interval", "start": 500, "end": 100,
+     "last_n": null, "reason": "inverted"}
+  ],
+  "if_range": {"kind": "etag", "weak": false, "value": "\"v3-strong\"",
+               "compared_with": "etag", "matched": true},
+  "plan": { "object_length": 256, "blocks": [ ... ], "mappings": [ ... ] }
+}
+```
+
+其他两种决策的信封示例：
+
+```json
+// If-Range 不匹配（或未携带 Range）：代理回源完整对象
+{"decision": "full_object", "status_code": 200,
+ "headers": {"Accept-Ranges": "bytes"},
+ "reason": "if_range_mismatch", "object_length": 256,
+ "if_range": {"kind": "etag", "weak": false, "value": "\"v1-stale\"",
+              "compared_with": "etag", "matched": false}}
+
+// 所有段都不可满足
+{"decision": "range_not_satisfiable", "status_code": 416,
+ "headers": {"Accept-Ranges": "bytes", "Content-Range": "bytes */256"},
+ "object_length": 256, "skipped_ranges": [ ... ], "if_range": null}
+```
+
+代理只需按信封的 `status_code` / `headers` 组装对客户端的响应，并在 206 时按
+`plan.blocks[].range_header` 回源、走 `/verify-fetch-batch` → `/assemble` →
+`/range-response` 既有链路即可。仅依赖标准库的完整示例（决策 → 模拟回源 →
+`/assemble` 逐字节核对，并演示 200/416 分支）见
+[`examples/client_range_decision_example.py`](examples/client_range_decision_example.py)：
+
+```
+python examples/client_range_decision_example.py
+```
+
+主要错误码（HTTP 422，错误体
+`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`）：
+
+| error | loc | 含义 |
+| --- | --- | --- |
+| `invalid_header` | `range` | Range 头语法非法（错误单位、缺 `=`、空段、段内空白、非数字、多个 `-`、前导 `+`、CR/LF 折行、非 ASCII 等） |
+| `weak_etag` | `etag` | 当前 ETag 是弱标签，不能作为强验证器 |
+| `invalid_etag` | `etag` | 当前 ETag 不是合法的强 opaque-tag |
+| `invalid_http_date` | `last_modified` / `if_range` | 不是合法 HTTP-date（含错误星期、不存在的日期如 2 月 30 日、非 GMT 时区等） |
+| `invalid_if_range_etag` | `if_range` | If-Range 的 entity-tag 形态非法（`W/` 后不是合法 opaque-tag 等） |
+| `invalid_request` | 字段路径 | 缺字段、类型错误、`etag` 与 `last_modified` 均缺省、`fetch_limit<1`、cache_id 重复等 |
+
+206 规划阶段的 `/plan` 语义错误（例如不带 `cached_blocks` 时单个交付范围长度
+超过 `fetch_limit`）沿用 `/plan` 的
+`{"error": "unsatisfiable", "range_index": ...}` 422，其中 `range_index` 是
+**交付范围**下标（被跳过的段不占位）。
 
 ## 错误响应
 
