@@ -39,6 +39,13 @@
   `filename*`（支持 UTF-8 / ISO-8859-1 百分号编码），无效或缺失时回退到传统
   `filename`；解码后剥离路径前缀（`/` 与 `\`）、控制字符及尾部点/空格，空名与
   `.` / `..` 等危险名称一律拒绝，无法得到有效名称时返回 `422`。
+- `POST /client-range-decision`：对象代理的**前置决策入口**，把客户端的
+  `Range` 与可选 `If-Range` 请求头转换为可执行决策。严格按 RFC 9110 解析多段
+  闭区间、开放终点（`bytes=500-`）与 suffix（`bytes=-500`），单个不可满足段
+  跳过、全部不可满足给出 `416`（`Content-Range: bytes */总长`）；`If-Range`
+  与当前强 ETag / Last-Modified 不匹配（弱 ETag 永不强匹配）时忽略 Range
+  返回完整对象的 `200` 决策；匹配时复用现有规划逻辑给出 `206` 决策与可直接
+  交给 `/assemble` 的 `plan`。非法头值返回带 `loc` 的可定位 `422`。
 
 ## Docker 一键启动
 
@@ -833,6 +840,163 @@ quoted-string、disposition type 缺失等）返回
 `{"error": "invalid_content_disposition", "message": ...}`。请求体字段缺失、
 为空、超长或类型错误则与其他端点一致返回 `422 invalid_request`。
 
+### `POST /client-range-decision`
+
+收到客户端的条件范围请求后，用本端点把原始 `Range` / `If-Range` 头转换成
+**对象代理可直接执行的决策**：该回完整对象（`200`）、部分内容（`206`，附带
+可直接回源并交给 [`/assemble`](#post-assemble) 的 `/plan` 结果）还是
+`416`。本端点不需要任何环境变量配置。
+
+服务地址与端口与其他端点一致：`http://127.0.0.1:8080`（容器内固定监听
+8080，Docker Compose 默认只绑定本机回环地址）。
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_length` | 对象总字节长度 |
+| `etag` | 对象当前的**强** ETag 头原值（如 `"\"v3\""`，含引号）；与 `last_modified` 至少提供一个，弱标签（`W/` 前缀）直接拒绝 |
+| `last_modified` | 对象当前的 `Last-Modified` 头原值，必须是 IMF-fixdate（如 `Wed, 21 Oct 2015 07:28:00 GMT`） |
+| `range_header` | 客户端 `Range` 头原值，仅支持 bytes 单位；省略或为 `null` 表示未携带 Range（决策 200） |
+| `if_range` | 可选，客户端 `If-Range` 头原值：强 ETag 或 IMF-fixdate |
+| `max_gap` / `fetch_limit` | 现有 `/plan` 的规划参数（含义相同） |
+| `cached_blocks` | 可选，语义与 `/plan` 的 `cached_blocks` 完全一致 |
+
+请求示例（单段闭区间）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/client-range-decision \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "object_length": 256,
+    "etag": "\"v3-strong\"",
+    "range_header": "bytes=0-99",
+    "max_gap": 8,
+    "fetch_limit": 128
+  }'
+```
+
+```json
+{
+  "status_code": 206,
+  "reason": "partial",
+  "headers": {
+    "Content-Length": "100",
+    "Content-Range": "bytes 0-99/256"
+  },
+  "object_length": 256,
+  "media_type": "single",
+  "content_length": 100,
+  "segments": [
+    {"index": 0, "kind": "closed", "requested_start": 0, "requested_end": 99,
+     "suffix_length": null, "satisfiable": true, "start": 0, "end": 99,
+     "plan_range_index": 0, "reason": "satisfied"}
+  ],
+  "satisfied_count": 1,
+  "skipped_count": 0,
+  "if_range_matched": true,
+  "if_range_kind": null,
+  "plan": {
+    "object_length": 256,
+    "blocks": [
+      {"index": 0, "start": 0, "end": 99, "length": 100, "range_header": "bytes=0-99"}
+    ],
+    "mappings": [ ... ],
+    "cached_blocks": []
+  }
+}
+```
+
+206 决策中的 `plan` 就是标准 `/plan` 响应（`blocks` / `mappings` /
+`cached_blocks`）：代理按 `blocks[].range_header` 逐块回源后，把它与回源
+内容原样提交给 `/assemble`，再用 `/range-response` 生成最终 206 响应。
+完整的决策 → 回源 → 重组链路示例见
+[`examples/client_range_decision_example.py`](examples/client_range_decision_example.py)：
+
+```
+python examples/client_range_decision_example.py
+```
+
+#### 决策规则
+
+1. **无 Range（省略 / `null`）**：`status_code=200, reason=range_absent`，
+   `headers` 只有 `Content-Length: <object_length>`，`plan` 为 `null`。
+2. **携带 `If-Range` 时先做强比较**：
+   - ETag 形式：必须与当前 `etag` **逐字节全等**才匹配；`W/` 弱标签即使取值
+     相同也**不强匹配**（当前 ETag 自身是弱标签会被 422 拒绝，不会参与比较）；
+   - 日期形式：当前 `last_modified` 早于或等于 `If-Range` 时刻才匹配
+     （只接受 IMF-fixdate，并校验星期与日历日期一致）；
+   - 不匹配（或没有对应类型的当前验证器可比较）时**忽略 Range**，
+     `status_code=200, reason=if_range_mismatch`，`plan` 为 `null`。
+3. **Range 解析（RFC 9110 bytes 单位，大小写不敏感）**：
+   - 闭区间 `bytes=A-B`：`B` 超过对象尾端时收敛到尾端（如对象 256 字节时
+     `bytes=250-9999` → `250-255`），仍可满足；
+   - 开放终点 `bytes=A-`：取 `A` 到对象尾端；
+   - suffix `bytes=-N`：取末尾 N 字节；N 大于对象长度时回落到整个对象；
+   - 单个**不可满足段被跳过**（起点 `>= object_length` 的闭区间/开放终点、
+     空对象上的 suffix），其余段照常 206；跳过信息见 `segments[].reason`
+     （`skipped_start_past_end` / `skipped_empty_object_suffix`）与
+     `skipped_count`；
+   - **全部段不可满足**：`status_code=416, reason=unsatisfiable`，
+     `headers` 恰好为 `{"Content-Range": "bytes */<object_length>"}`，
+     `plan` 为 `null`。
+4. **206 响应形式**：1 个可满足段时 `media_type="single"`，`headers` 含
+   `Content-Length` 与该段的 `Content-Range`；多个可满足段时
+   `media_type="multipart/byteranges"`（最终 `Content-Length` 取决于 multipart
+   分帧，代理可用 `/range-response` 生成完整响应）。`content_length` 为各可满足
+   段范围字节之和；`plan` 始终基于**可满足段**（其顺序与
+   `segments[].plan_range_index` 对应），大范围超过 `fetch_limit` 时按现有
+   缓存感知逻辑自动拆块。
+
+多段 + 跳过示例（对象 256 字节，末段不可满足被跳过）：
+
+```json
+{
+  "object_length": 256,
+  "etag": "\"v3-strong\"",
+  "range_header": "bytes=0-9, 240-, -16, 1000-2000",
+  "max_gap": 8,
+  "fetch_limit": 128
+}
+```
+
+返回 `status_code=206, media_type="multipart/byteranges"`，
+`satisfied_count=3`、`skipped_count=1`；`If-Range` 不匹配示例：
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/client-range-decision \
+  -H 'Content-Type: application/json' \
+  --data-raw '{
+    "object_length": 256,
+    "etag": "\"v3-strong\"",
+    "range_header": "bytes=0-99",
+    "if_range": "\"stale-version\"",
+    "max_gap": 8,
+    "fetch_limit": 128
+  }'
+# {"status_code":200,"reason":"if_range_mismatch",
+#  "headers":{"Content-Length":"256"},"plan":null,"if_range_matched":false,...}
+```
+
+非法头值统一返回 `422`，响应体为
+`{"error": "<code>", "detail": [{"message": ..., "loc": ..., "range_index": ...}]}`，
+`loc` 精确定位：
+
+| loc | 触发场景 |
+| --- | --- |
+| `range_header` | 非 bytes 单位、`bytes=` 后为空、空字符串/空白 Range、控制字符注入 |
+| `range_header.ranges[i]` | 第 i 个范围表达式非法（反转区间、`-0`、数字内部空白、非数字等） |
+| `if_range` | If-Range 既不是合法强 ETag 也不是合法 IMF-fixdate（含错误星期） |
+| `etag` | 当前 ETag 为弱标签或不是合法强 opaque-tag |
+| `last_modified` | 当前 Last-Modified 不是合法 IMF-fixdate |
+
+主要错误码：`invalid_range_unit` / `invalid_range_header` /
+`invalid_range_spec`（附带 `range_index`）/ `malformed_header`（CR/LF 等控制
+字符）/ `weak_current_etag` / `invalid_current_etag` /
+`invalid_if_range_etag` / `invalid_if_range_date` /
+`invalid_last_modified` / `missing_etag`。请求体字段缺失或类型错误与其他
+端点一致为 `422 invalid_request`（`etag` 与 `last_modified` 至少提供一个）。
+
 ## 错误响应
 
 业务请求/语义错误统一返回 HTTP `422`：
@@ -846,6 +1010,12 @@ quoted-string、disposition type 缺失等）返回
   `{"error": "invalid_content_disposition", "message": ...}`，
   在头值合法但解析/清理后无任何可用名称时返回
   `{"error": "no_safe_filename", "message": ...}`；
+- `/client-range-decision` 的 Range/If-Range/ETag/Last-Modified 头值错误采用
+  `detail[0].loc` 可定位结构（`range_header`、`range_header.ranges[i]`、
+  `if_range`、`etag`、`last_modified`，范围错误附 `range_index`）；注意
+  `200`/`206`/`416` 是**正常决策结果**（HTTP 200 返回，状态码在响应体
+  `status_code` 中），只有头值非法/字段错误才是 HTTP `422`，错误码与含义见
+  [`POST /client-range-decision`](#post-client-range-decision) 一节；
 - `/plan` 范围不可满足：`{"error": "unsatisfiable", "message": ..., "range_index": ...}`；
 - `/assemble` 组装错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，
   其中 `loc` 指向出错的字段路径（如 `contents[2].data_b64`、

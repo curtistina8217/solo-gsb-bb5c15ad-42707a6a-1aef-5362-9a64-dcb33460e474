@@ -52,6 +52,18 @@ POST /safe-download-name 解析上游 Content-Disposition 头值，产出可直�
 回退到传统 filename（token 或 quoted-string，按 UTF-8 优先、ISO-8859-1
 兜底解码）；解码后剥离路径前缀（/ 与 \\）、全部控制字符以及尾部的点与
 空格，空名与 "."/".." 等危险名称一律拒绝，无法得到有效名称时返回 422。
+
+POST /client-range-decision 是对象代理的前置决策入口：接收对象总长度、
+当前强验证器（强 ETag 或 Last-Modified，至少其一）、客户端原始 Range
+与可选 If-Range 头值，以及 /plan 的规划参数。服务严格按 RFC 9110 的
+字节范围语法解析多段闭区间、开放终点（bytes=500-）与 suffix
+（bytes=-500），越界闭区间/开放终点按对象尾端收敛，单个不可满足段被
+跳过，全部不可满足时给出 416 决策（Content-Range: bytes */总长）。
+If-Range 与当前验证器不匹配（含弱 ETag）时忽略 Range，给出完整对象的
+200 决策；匹配或未携带 If-Range 时对可满足范围复用现有缓存感知规划，
+给出 206 决策与可直接提交给 /assemble 的 plan。非法头值一律返回带
+loc（range_header / if_range / etag / last_modified）的 422；当前
+ETag 必须是强验证器，弱标签直接拒绝。
 """
 
 from __future__ import annotations
@@ -59,6 +71,7 @@ from __future__ import annotations
 import base64
 import binascii
 import bisect
+import datetime
 import hashlib
 import hmac
 import json
@@ -2958,3 +2971,704 @@ def safe_download_name(req: SafeDownloadNameRequest) -> SafeDownloadNameResponse
     """解析上游 Content-Disposition，返回去除路径与危险字符后的单一文件名。"""
     filename, source = derive_download_name(req.content_disposition)
     return SafeDownloadNameResponse(filename=filename, source=source)
+
+
+# --------------------------- /client-range-decision ---------------------------
+
+# 头值长度上限：抵御超长输入（HTTP 头本身通常远小于此）。
+_CLIENT_HEADER_MAX_LENGTH = 8192
+
+# IMF-fixdate（RFC 9110 §5.6.7）：Day, DD Mon YYYY HH:MM:SS GMT。
+_IMF_FIXDATE_RE = re.compile(
+    r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) "
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) "
+    r"(\d{2}):(\d{2}):(\d{2}) GMT$"
+)
+_IMF_WEEKDAYS: dict[str, int] = {
+    "Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6,
+}
+_IMF_MONTHS: dict[str, int] = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+# 头部解析共用：CR/LF 及其他控制字符一律拒绝（防注入与折行）。
+_OWS_STRIP = " \t"
+
+
+class ClientRangeDecisionRequest(BaseModel):
+    """/client-range-decision 请求：客户端条件头 + 对象元数据 + /plan 参数。
+
+    range_header 省略或为 null 表示客户端未发送 Range（决策为完整对象
+    200）；etag 与 last_modified 至少提供一个，用于评估 If-Range。
+    """
+
+    object_length: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="对象总字节长度"
+    )
+    etag: str | None = Field(
+        None,
+        max_length=_CLIENT_HEADER_MAX_LENGTH,
+        description="对象当前的强 ETag 头原值（如 '\"v3\"'）；不得为弱标签",
+    )
+    last_modified: str | None = Field(
+        None,
+        max_length=_CLIENT_HEADER_MAX_LENGTH,
+        description="对象当前的 Last-Modified 头原值（IMF-fixdate）",
+    )
+    range_header: str | None = Field(
+        None,
+        max_length=_CLIENT_HEADER_MAX_LENGTH,
+        description="客户端 Range 头原值（仅支持 bytes 单位）；省略/null 视为无 Range",
+    )
+    if_range: str | None = Field(
+        None,
+        max_length=_CLIENT_HEADER_MAX_LENGTH,
+        description="客户端 If-Range 头原值：强 ETag 或 IMF-fixdate",
+    )
+    max_gap: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="允许合并的最大间隙（字节），透传给 /plan"
+    )
+    fetch_limit: Annotated[int, StrictInt] = Field(
+        ..., ge=1, description="单次回源上限（字节），透传给 /plan"
+    )
+    cached_blocks: list[CachedBlock] = Field(
+        default_factory=list,
+        description="可选的已缓存块列表；语义与 /plan 完全一致",
+    )
+
+    @model_validator(mode="after")
+    def _check_validators_and_cache_ids(self) -> "ClientRangeDecisionRequest":
+        # 显式空字符串由各自解析器按非法头值报 422（loc 可定位）；
+        # 这里只保证至少提供一个验证器字段。
+        if self.etag is None and self.last_modified is None:
+            raise ValueError("etag 与 last_modified 至少必须提供一个")
+        seen: set[object] = set()
+        for cb in self.cached_blocks:
+            if cb.cache_id in seen:
+                raise ValueError(
+                    f"cached_blocks 中 cache_id {cb.cache_id!r} 重复"
+                )
+            seen.add(cb.cache_id)
+        return self
+
+
+class ClientRangeSegment(BaseModel):
+    """单个 Range 段的解析与规范化结果（含被跳过的不可满足段）。"""
+
+    index: int = Field(..., description="该段在 Range 头中的顺序下标（从 0 起，忽略空成员）")
+    kind: Literal["closed", "open", "suffix"] = Field(
+        ..., description="closed=bytes=A-B，open=bytes=A-，suffix=bytes=-N"
+    )
+    requested_start: int | None = Field(
+        ..., description="closed/open 的首字节位置；suffix 为 null"
+    )
+    requested_end: int | None = Field(
+        ..., description="closed 的末字节位置；open/suffix 为 null"
+    )
+    suffix_length: int | None = Field(
+        ..., description="suffix 请求的末尾字节数；closed/open 为 null"
+    )
+    satisfiable: bool = Field(..., description="是否可满足（不可满足段会被跳过）")
+    start: int | None = Field(
+        None, description="规范化后的起始字节偏移（含）；不可满足时为 null"
+    )
+    end: int | None = Field(
+        None, description="规范化后的结束字节偏移（含）；不可满足时为 null"
+    )
+    plan_range_index: int | None = Field(
+        None,
+        description="送入 /plan 的范围下标（仅可满足段，按可满足段顺序从 0 起）",
+    )
+    reason: str = Field(
+        ...,
+        description="satisfied / skipped_start_past_end（闭区间/开放终点起点 >= 总长）"
+        " / skipped_empty_object_suffix（空对象上的 suffix）",
+    )
+
+
+class ClientRangeDecision(BaseModel):
+    """代理可直接执行的决策：status_code + headers + 206 时的 /plan 结果。"""
+
+    status_code: Literal[200, 206, 416] = Field(
+        ..., description="应对客户端使用的 HTTP 状态码"
+    )
+    reason: str = Field(
+        ...,
+        description="决策原因：range_absent / if_range_mismatch / partial / unsatisfiable",
+    )
+    headers: dict[str, str] = Field(
+        ..., description="应随响应下发的头字段（206 单段或 416 时含 Content-Range）"
+    )
+    object_length: int
+    media_type: Literal["single", "multipart/byteranges"] | None = Field(
+        None,
+        description="206 时的正文形式：1 段为 single，多段为 multipart/byteranges；"
+        "200/416 为 null",
+    )
+    content_length: int | None = Field(
+        None,
+        description="200 时为完整对象长度；206 时为可满足范围字节数之和"
+        "（多段 multipart 不含分帧开销，实际 Content-Length 以 /range-response "
+        "生成的正文为准）；416 为 null",
+    )
+    segments: list[ClientRangeSegment] = Field(
+        default_factory=list,
+        description="Range 头各段解析结果；无 Range（200）时为空列表",
+    )
+    satisfied_count: int = Field(
+        ..., description="可满足段数量（206 时 >=1，416 时为 0）"
+    )
+    skipped_count: int = Field(..., description="被跳过的不可满足段数量")
+    if_range_matched: bool = Field(
+        ..., description="If-Range 是否与当前验证器匹配（未携带 If-Range 时为 true）"
+    )
+    if_range_kind: Literal["etag", "date"] | None = Field(
+        None, description="If-Range 的解释方式；未携带时为 null"
+    )
+    plan: PlanResponse | None = Field(
+        None,
+        description="206 决策的 /plan 完整结果：blocks/mappings/cached_blocks "
+        "可原样用于回源与 /assemble；200/416 为 null",
+    )
+
+
+class ClientRangeError(Exception):
+    """客户端头（Range/If-Range/ETag/Last-Modified）解析与校验失败，HTTP 422。
+
+    loc 为可定位的字段路径："range_header"、"range_header.ranges[i]"、
+    "if_range"、"etag"、"last_modified"。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        loc: str,
+        *,
+        code: str = "client_range_error",
+        range_index: int | None = None,
+    ):
+        self.message = message
+        self.loc = loc
+        self.code = code
+        self.range_index = range_index
+        super().__init__(message)
+
+
+@app.exception_handler(ClientRangeError)
+async def client_range_error_handler(request: Request, exc: ClientRangeError):
+    detail: dict[str, object] = {"message": exc.message, "loc": exc.loc}
+    if exc.range_index is not None:
+        detail["range_index"] = exc.range_index
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "detail": [detail]},
+    )
+
+
+def _reject_header_chars(value: str, loc: str) -> None:
+    """拒绝头值中的 CR/LF 与其他 ASCII 控制字符（防折行/头部注入）。"""
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ClientRangeError(
+            "头值不允许包含 CR/LF 或其他控制字符（拒绝折行与头部注入）",
+            loc,
+            code="malformed_header",
+        )
+
+
+def _parse_current_strong_etag(raw: str) -> str:
+    """校验对象当前 ETag 必须是合法强 ETag，返回去首尾 OWS 后的原值。"""
+    _reject_header_chars(raw, "etag")
+    value = raw.strip(_OWS_STRIP)
+    if not value:
+        raise ClientRangeError("etag 不能为空", "etag", code="missing_etag")
+    if value[:2].lower() == "w/":
+        raise ClientRangeError(
+            "对象当前 ETag 是弱 ETag（W/ 前缀）：If-Range 只允许强比较，"
+            "弱验证器不得作为当前验证器",
+            "etag",
+            code="weak_current_etag",
+        )
+    if not _STRONG_ETAG_RE.fullmatch(value):
+        raise ClientRangeError(
+            "对象当前 ETag 不是合法的强 ETag：必须为双引号包裹的 "
+            'opaque-tag（如 "v1"），不得含空格、控制字符或裸引号',
+            "etag",
+            code="invalid_current_etag",
+        )
+    return value
+
+
+def _parse_http_date(raw: str, loc: str, *, code: str) -> datetime.datetime:
+    """严格解析 IMF-fixdate（RFC 9110 §5.6.7），返回 UTC 感知 datetime。
+
+    大小写敏感、星期必须与日历日期一致、拒绝越界的日/时/分/秒；不接受
+    RFC 850 / asctime 等废弃日期形式。
+    """
+    _reject_header_chars(raw, loc)
+    m = _IMF_FIXDATE_RE.fullmatch(raw.strip(_OWS_STRIP))
+    if m is None:
+        raise ClientRangeError(
+            "不是合法的 IMF-fixdate，期望形如 'Wed, 21 Oct 2015 07:28:00 GMT' "
+            "（不接受 RFC 850/asctime 等废弃日期形式）",
+            loc,
+            code=code,
+        )
+    wd_name, day, mon_name, year, hour, minute, second = m.groups()
+    try:
+        dt = datetime.datetime(
+            int(year),
+            _IMF_MONTHS[mon_name],
+            int(day),
+            int(hour),
+            int(minute),
+            int(second),
+            tzinfo=datetime.timezone.utc,
+        )
+    except ValueError as exc:
+        raise ClientRangeError(f"日期的日/时间分量越界：{exc}", loc, code=code)
+    if dt.weekday() != _IMF_WEEKDAYS[wd_name]:
+        raise ClientRangeError(
+            f"星期 {wd_name} 与日历日期 {dt.date().isoformat()} 不一致",
+            loc,
+            code=code,
+        )
+    return dt
+
+
+# Range 头中单个成员的解析结果：
+#   ("closed", start, end) / ("open", start, None) / ("suffix", None, last_n)
+def _parse_range_header(raw: str) -> list[tuple[str, int | None, int | None]]:
+    """严格按 RFC 9110 §14.1.1 解析 ``bytes=...`` 字节范围头。
+
+    仅接受 bytes 单位（大小写不敏感）；成员可以是闭区间 ``A-B``、开放终点
+    ``A-`` 或 suffix ``-N``。允许成员前后及逗号周围的 OWS，但数字内部不
+    得有空白；空成员（重复逗号）忽略。任何语法错误（反转区间、负数、
+    非数字、空表达式等）抛 ClientRangeError(loc="range_header...")。
+    返回 [(kind, a, b), ...]：closed=(closed,start,end)、
+    open=(open,start,None)、suffix=(suffix,None,last_n)。
+    """
+    loc = "range_header"
+    _reject_header_chars(raw, loc)
+    text = raw.strip(_OWS_STRIP)
+    if not text:
+        raise ClientRangeError(
+            "Range 头为空：省略/为 null 表示无 Range，空字符串是非法头值",
+            loc,
+            code="invalid_range_header",
+        )
+    # 单位与 '=' 之间不得有空白（RFC：bytes-unit = "bytes" "="）。
+    if len(text) < 6 or text[:5].lower() != "bytes" or text[5] != "=":
+        raise ClientRangeError(
+            "Range 仅支持 bytes 单位，且必须形如 'bytes=<ranges>'",
+            loc,
+            code="invalid_range_unit",
+        )
+    body = text[6:].strip(_OWS_STRIP)
+    if not body:
+        raise ClientRangeError(
+            "Range 头 'bytes=' 之后没有任何范围表达式",
+            loc,
+            code="invalid_range_header",
+        )
+
+    members: list[tuple[str, int | None, int | None]] = []
+    for pos, part in enumerate(body.split(",")):
+        token = part.strip(_OWS_STRIP)
+        if not token:
+            # 容忍重复逗号产生的空成员（RFC 允许 OWS，空集合在整体校验时报错）。
+            continue
+        member_loc = f"{loc}.ranges[{pos}]"
+        if any(ch in token for ch in " \t"):
+            raise ClientRangeError(
+                f"范围表达式 {token!r} 内部不允许出现空白",
+                member_loc,
+                code="invalid_range_spec",
+                range_index=pos,
+            )
+        if token.startswith("-"):
+            digits = token[1:]
+            if not digits or not digits.isascii() or not digits.isdigit():
+                raise ClientRangeError(
+                    f"suffix 范围 {token!r} 非法：必须形如 '-N'，N 为正整数",
+                    member_loc,
+                    code="invalid_range_spec",
+                    range_index=pos,
+                )
+            last_n = int(digits)
+            if last_n == 0:
+                raise ClientRangeError(
+                    "suffix 范围 '-0' 非法：suffix-byte-range-spec 的长度必须 >= 1",
+                    member_loc,
+                    code="invalid_range_spec",
+                    range_index=pos,
+                )
+            members.append(("suffix", None, last_n))
+            continue
+
+        if "-" not in token:
+            raise ClientRangeError(
+                f"范围表达式 {token!r} 非法：闭区间需形如 'A-B'，开放终点需形如 'A-'",
+                member_loc,
+                code="invalid_range_spec",
+                range_index=pos,
+            )
+        first, sep, second = token.partition("-")
+        if not first.isascii() or not first.isdigit() or "-" in second:
+            raise ClientRangeError(
+                f"范围表达式 {token!r} 非法：数字之间出现多余 '-' 或非数字字符",
+                member_loc,
+                code="invalid_range_spec",
+                range_index=pos,
+            )
+        start = int(first)
+        if second == "":
+            members.append(("open", start, None))
+        else:
+            if not second.isascii() or not second.isdigit():
+                raise ClientRangeError(
+                    f"闭区间 {token!r} 的末字节位置必须是非负整数",
+                    member_loc,
+                    code="invalid_range_spec",
+                    range_index=pos,
+                )
+            end = int(second)
+            if end < start:
+                raise ClientRangeError(
+                    f"闭区间 {token!r} 非法：末字节位置 {end} 小于首字节位置 {start}",
+                    member_loc,
+                    code="invalid_range_spec",
+                    range_index=pos,
+                )
+            members.append(("closed", start, end))
+
+    if not members:
+        raise ClientRangeError(
+            "Range 头不包含任何有效的字节范围表达式",
+            loc,
+            code="invalid_range_header",
+        )
+    return members
+
+
+def _parse_if_range(
+    raw: str,
+) -> tuple[Literal["etag", "date"], str | datetime.datetime]:
+    """解析 If-Range 头为 (kind, value)。
+
+    以双引号开头时按 entity-tag 解析：必须是合法 opaque-tag；弱标签
+    （W/ 前缀）语法合法但永远不能强匹配，由比较阶段决定；其他值按
+    IMF-fixdate 解析。任何语法错误抛 ClientRangeError(loc="if_range")。
+    """
+    loc = "if_range"
+    _reject_header_chars(raw, loc)
+    value = raw.strip(_OWS_STRIP)
+    if not value:
+        raise ClientRangeError(
+            "If-Range 头为空：省略/null 表示不携带条件，空字符串是非法头值",
+            loc,
+            code="invalid_if_range",
+        )
+    if value[:1] == '"':
+        # entity-tag 形式（强标签）。
+        if not _STRONG_ETAG_RE.fullmatch(value):
+            raise ClientRangeError(
+                "If-Range 的 ETag 不是合法的强 opaque-tag：必须为双引号包裹"
+                '（如 "v1"），不得含空格、控制字符或裸引号',
+                loc,
+                code="invalid_if_range_etag",
+            )
+        return "etag", value
+    if value[:2].lower() == "w/":
+        # 弱标签语法合法，但 If-Range 只做强比较：交给比较阶段判定不匹配。
+        weak = value[2:]
+        if not _STRONG_ETAG_RE.fullmatch(weak):
+            raise ClientRangeError(
+                "If-Range 的弱 ETag 取值不是合法 opaque-tag",
+                loc,
+                code="invalid_if_range_etag",
+            )
+        return "etag", value
+    return "date", _parse_http_date(value, loc, code="invalid_if_range_date")
+
+
+@app.post("/client-range-decision", response_model=ClientRangeDecision)
+def client_range_decision(
+    req: ClientRangeDecisionRequest,
+) -> ClientRangeDecision:
+    """把客户端 Range/If-Range 头转换为对象代理可执行的响应决策。
+
+    1. 校验当前验证器（强 ETag / Last-Modified）与 If-Range 头语法；
+    2. 解析 Range 头（无 Range 直接给出完整对象 200 决策）；
+    3. 携带 If-Range 且与当前验证器不强匹配时，忽略 Range，给出完整
+       对象 200 决策（弱 ETag 永不强匹配）；
+    4. 逐段规范化，跳过单个不可满足段；全部不可满足给出 416 决策
+       （Content-Range: bytes */总长）；
+    5. 对可满足段复用缓存感知 /plan 逻辑，给出 206 决策与可直接用于
+       /assemble 的 plan。
+    """
+    # 0. 当前验证器：至少一个非空（pydantic 层已校验），各自必须合法。
+    #    显式提供的空白字符串属于非法头值（区别于省略/null），交由解析器报错。
+    current_etag: str | None = None
+    if req.etag is not None:
+        current_etag = _parse_current_strong_etag(req.etag)
+    current_lm: datetime.datetime | None = None
+    if req.last_modified is not None:
+        current_lm = _parse_http_date(
+            req.last_modified, "last_modified", code="invalid_last_modified"
+        )
+
+    # 1. If-Range 语法先解析（即使没有 Range，非法头值仍是 422；null/省略
+    #    才是未携带，显式空白字符串为非法头值）。
+    if_range_kind: Literal["etag", "date"] | None = None
+    if_range_value: str | datetime.datetime | None = None
+    if req.if_range is not None:
+        if_range_kind, if_range_value = _parse_if_range(req.if_range)
+
+    # 2. Range 头：显式空白值视为非法头值；省略/null 才是“无 Range”。
+    if req.range_header is not None and not req.range_header.strip(_OWS_STRIP):
+        raise ClientRangeError(
+            "Range 头为空白：省略/null 表示无 Range，空字符串是非法头值",
+            "range_header",
+            code="invalid_range_header",
+        )
+    if req.range_header is None:
+        # 无 Range：直接完整对象 200（If-Range 无意义，已在上面完成语法校验）。
+        return ClientRangeDecision(
+            status_code=200,
+            reason="range_absent",
+            headers={"Content-Length": str(req.object_length)},
+            object_length=req.object_length,
+            media_type=None,
+            content_length=req.object_length,
+            segments=[],
+            satisfied_count=0,
+            skipped_count=0,
+            if_range_matched=True,
+            if_range_kind=None,
+            plan=None,
+        )
+
+    members = _parse_range_header(req.range_header)
+
+    # 3. If-Range 强比较：ETag 全等（弱标签永不匹配）；日期采用
+    #    “当前 Last-Modified 早于或等于 If-Range 时刻”的强比较规则。
+    if_range_matched = True
+    if if_range_kind is not None:
+        if if_range_kind == "etag":
+            # 弱标签（W/ 前缀）不允许强匹配；强标签与当前 ETag 逐字节全等。
+            asserted = if_range_value
+            assert isinstance(asserted, str)
+            if_range_matched = (
+                asserted[:2].lower() != "w/"
+                and current_etag is not None
+                and asserted == current_etag
+            )
+        else:
+            asserted_dt = if_range_value
+            assert isinstance(asserted_dt, datetime.datetime)
+            if_range_matched = (
+                current_lm is not None and current_lm <= asserted_dt
+            )
+
+    # 4. If-Range 不匹配：忽略 Range，返回完整对象的 200 决策。
+    if not if_range_matched:
+        return ClientRangeDecision(
+            status_code=200,
+            reason="if_range_mismatch",
+            headers={"Content-Length": str(req.object_length)},
+            object_length=req.object_length,
+            media_type=None,
+            content_length=req.object_length,
+            segments=[],
+            satisfied_count=0,
+            skipped_count=0,
+            if_range_matched=False,
+            if_range_kind=if_range_kind,
+            plan=None,
+        )
+
+    # 5. 逐段规范化为闭区间；单个不可满足段跳过（RFC 9110：只要还有可
+    #    满足段就发送 206，不可满足段被忽略）。
+    segments: list[ClientRangeSegment] = []
+    specs: list[RangeSpec] = []
+    plan_index = 0
+    for i, (kind, a, b) in enumerate(members):
+        if kind == "closed":
+            start, end = a, b
+            assert start is not None and end is not None
+            if start >= req.object_length:
+                segments.append(
+                    ClientRangeSegment(
+                        index=i,
+                        kind="closed",
+                        requested_start=start,
+                        requested_end=end,
+                        suffix_length=None,
+                        satisfiable=False,
+                        start=None,
+                        end=None,
+                        plan_range_index=None,
+                        reason="skipped_start_past_end",
+                    )
+                )
+                continue
+            clamped_end = min(end, req.object_length - 1)
+            segments.append(
+                ClientRangeSegment(
+                    index=i,
+                    kind="closed",
+                    requested_start=start,
+                    requested_end=end,
+                    suffix_length=None,
+                    satisfiable=True,
+                    start=start,
+                    end=clamped_end,
+                    plan_range_index=plan_index,
+                    reason="satisfied",
+                )
+            )
+            specs.append(IntervalRange(type="interval", start=start, end=clamped_end))
+            plan_index += 1
+        elif kind == "open":
+            start = a
+            assert start is not None
+            if start >= req.object_length:
+                segments.append(
+                    ClientRangeSegment(
+                        index=i,
+                        kind="open",
+                        requested_start=start,
+                        requested_end=None,
+                        suffix_length=None,
+                        satisfiable=False,
+                        start=None,
+                        end=None,
+                        plan_range_index=None,
+                        reason="skipped_start_past_end",
+                    )
+                )
+                continue
+            end = req.object_length - 1
+            segments.append(
+                ClientRangeSegment(
+                    index=i,
+                    kind="open",
+                    requested_start=start,
+                    requested_end=None,
+                    suffix_length=None,
+                    satisfiable=True,
+                    start=start,
+                    end=end,
+                    plan_range_index=plan_index,
+                    reason="satisfied",
+                )
+            )
+            specs.append(IntervalRange(type="interval", start=start, end=end))
+            plan_index += 1
+        else:  # suffix
+            last_n = b
+            assert last_n is not None
+            if req.object_length == 0:
+                segments.append(
+                    ClientRangeSegment(
+                        index=i,
+                        kind="suffix",
+                        requested_start=None,
+                        requested_end=None,
+                        suffix_length=last_n,
+                        satisfiable=False,
+                        start=None,
+                        end=None,
+                        plan_range_index=None,
+                        reason="skipped_empty_object_suffix",
+                    )
+                )
+                continue
+            start = max(0, req.object_length - last_n)
+            end = req.object_length - 1
+            segments.append(
+                ClientRangeSegment(
+                    index=i,
+                    kind="suffix",
+                    requested_start=None,
+                    requested_end=None,
+                    suffix_length=last_n,
+                    satisfiable=True,
+                    start=start,
+                    end=end,
+                    plan_range_index=plan_index,
+                    reason="satisfied",
+                )
+            )
+            specs.append(SuffixRange(type="suffix", last_n=last_n))
+            plan_index += 1
+
+    satisfied = plan_index
+    skipped = len(segments) - satisfied
+
+    # 6. 全部不可满足：416，Content-Range: bytes */总长。
+    if satisfied == 0:
+        return ClientRangeDecision(
+            status_code=416,
+            reason="unsatisfiable",
+            headers={"Content-Range": f"bytes */{req.object_length}"},
+            object_length=req.object_length,
+            media_type=None,
+            content_length=None,
+            segments=segments,
+            satisfied_count=0,
+            skipped_count=skipped,
+            if_range_matched=True,
+            if_range_kind=if_range_kind,
+            plan=None,
+        )
+
+    # 7. 对可满足段复用现有缓存感知规划逻辑。客户端范围可能整段超过
+    #    fetch_limit（HTTP 允许请求整个对象），因此统一走可拆块的缓存
+    #    感知路径；无 cached_blocks 时其切片来源全部为 fetch，结果
+    #    （blocks/mappings/cached_blocks）与 /plan 输出结构完全一致，
+    #    可直接回交 /assemble。
+    plan_req = PlanRequest(
+        object_length=req.object_length,
+        ranges=specs,
+        max_gap=req.max_gap,
+        fetch_limit=req.fetch_limit,
+        cached_blocks=req.cached_blocks,
+    )
+    plan_result = plan_with_cache(plan_req)
+
+    total_bytes = sum(seg.end - seg.start + 1 for seg in segments if seg.satisfiable)
+    headers: dict[str, str]
+    if satisfied == 1:
+        only = next(seg for seg in segments if seg.satisfiable)
+        assert only.start is not None and only.end is not None
+        media_type: Literal["single", "multipart/byteranges"] = "single"
+        # 单段：Content-Length 与 Content-Range 都可直接确定。
+        headers = {
+            "Content-Length": str(total_bytes),
+            "Content-Range": (
+                f"bytes {only.start}-{only.end}/{req.object_length}"
+            ),
+        }
+    else:
+        # 多段：实际 Content-Length 取决于后续 /range-response 生成的
+        # multipart 分帧（boundary/part 头），决策不臆造该值；代理在
+        # 组装完成后填入或改用分块传输。content_length 仅统计各可满足
+        # 段的范围字节之和（不含分帧开销）。
+        media_type = "multipart/byteranges"
+        headers = {}
+
+    return ClientRangeDecision(
+        status_code=206,
+        reason="partial",
+        headers=headers,
+        object_length=req.object_length,
+        media_type=media_type,
+        content_length=total_bytes,
+        segments=segments,
+        satisfied_count=satisfied,
+        skipped_count=skipped,
+        if_range_matched=True,
+        if_range_kind=if_range_kind,
+        plan=plan_result,
+    )
